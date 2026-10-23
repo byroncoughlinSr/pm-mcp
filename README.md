@@ -1,12 +1,18 @@
 # pm-mcp
 
-A Model Context Protocol server that gives AI agents a shared project board:
-projects, milestones, tasks with dependencies, and a work queue that several
-agents can pull from at once without stepping on each other.
+A Model Context Protocol server for running construction projects with AI
+agents, from the owner's first brief through design, permitting, bidding,
+construction, closeout and warranty. It isn't tied to any one app: other
+construction systems can link their own ids to its projects, tasks and
+records and pull a full export.
+
+Under the construction layer is a general agent work board: projects,
+phases, tasks with dependencies, and a work queue that many agents can pull
+from at once without two of them taking the same task.
 
 Data lives in one SQLite file (default `~/.local/share/pm-mcp/pm.db`, override
 with `PM_MCP_DB` or `--db`). Every agent can run its own server process against
-the same file; task claims are atomic.
+the same file.
 
 ## Setup
 
@@ -14,7 +20,7 @@ the same file; task claims are atomic.
 cd /development/pm-mcp
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest        # 14 tests
+.venv/bin/python -m pytest
 ```
 
 ## Running
@@ -42,54 +48,124 @@ Add to the `mcp` block of `opencode.jsonc`:
 }
 ```
 
-## How agents use it
+## Construction projects
 
-**Planner agents** build the board:
-`create_project` → `create_milestone` → `create_task` (with `depends_on`,
-`parent_id`, `tags`, `priority`). The `plan_project` prompt walks a model
-through this.
+`create_construction_project(name, template, start_date, ...)` builds the whole
+plan in one call. Built-in templates:
 
-**Worker agents** loop (the `work_session` prompt spells it out):
+| Template | For |
+|---|---|
+| `residential_new` | Single-family home, ground up |
+| `residential_remodel` | Kitchen, bath, whole-house remodel or addition |
+| `commercial_new` | Ground-up commercial building, CM/GC delivery |
+| `commercial_tenant_improvement` | Interior build-out of leased space |
 
-1. `claim_next_task(agent="worker-1", tags=["backend"])` takes the
-   highest-priority task that is `todo`, unassigned, in an active project, and
-   has all dependencies done or cancelled.
-2. `heartbeat` while working. A claim lasts `lease_minutes` (default 30); if it
-   lapses, the task goes back to the queue so a crashed agent can't hold work
-   forever. `lease_minutes=0` means no expiry.
-3. `add_comment` for notes, decisions, questions.
-4. `complete_task(result=...)` (the reply lists tasks that just became ready),
-   or `release_task(reason=...)`, or `update_task(status="blocked")` plus a comment.
+Each template uses the same eight phases, created as milestones:
 
-**Anyone** can check progress with `project_report` (also readable as the
-resource `pm://projects/{id}/report`), `list_tasks`, `get_task` and
-`get_activity`.
+1. Pre-design & feasibility
+2. Design (schematic → design development → construction documents)
+3. Permitting
+4. Bidding & procurement
+5. Pre-construction
+6. Construction
+7. Closeout
+8. Warranty & post-occupancy
 
-## Tools
+Tasks carry working-day durations, dependencies, and **role tags** (`architect`,
+`estimator`, `permit`, `superintendent`, `concrete`, `framing`, `plumbing`,
+`electrical`, `hvac`, `inspection`, ...). A specialist agent calls
+`claim_next_task(agent=..., tags=["estimator"])` and only gets estimating work
+that is ready to start.
+
+Apps can store their own plans with `save_template` (start from
+`get_template("residential_new")` to copy the format).
+
+### Gates: permits and inspections
+
+Permit and inspection tasks are **gates**. They can't be completed directly;
+they finish when their linked record does:
+
+- `update_record(permit_id, status="approved")` completes the permit task.
+- `record_inspection_result(inspection_id, "passed")` completes the inspection
+  task. `"failed"` or `"partial"` creates a high-priority correction task,
+  tagged for the trades whose work was inspected, and the gate waits on it.
+  Call `record_inspection_result` again after the fix. Every attempt is kept.
+
+So the next phase of work can't start until the inspection actually passes.
+
+### Records
+
+`create_record` / `update_record` / `list_records` handle the project
+paperwork. `describe_record_types` returns each type's fields and statuses.
+
+| Type | Use |
+|---|---|
+| `permit` | Permits from the jurisdiction |
+| `inspection` | Required inspections, with result history |
+| `budget_item` | Cost lines: budgeted, committed, actual |
+| `change_order` | Scope, cost and schedule changes |
+| `rfi` | Questions to the design team or owner |
+| `submittal` | Shop drawings, product data, samples for review |
+| `punch_item` | Deficiencies to fix before handover |
+| `daily_log` | Site reports: weather, crew, work, delays |
+| `contact` | Owner, design team, subs, suppliers, inspectors |
+| `document` | Drawings, specs, estimates, contracts (by URL or path) |
+
+Records are numbered per project (RFI #1, #2...). Unknown fields in `data` are
+kept, so an app can attach its own.
+
+### Oversight
+
+- `construction_dashboard`: current phase, progress per phase, forecast finish vs
+  target, critical path, permits, inspections, open RFIs/submittals/change
+  orders/punch items, overdue items, tasks behind plan, ready work by role,
+  budget totals. Also readable as `pm://projects/{id}/dashboard`.
+- `compute_schedule`: critical-path schedule in working days. `plan` is the
+  baseline; `forecast` uses actual completion dates and pushes unstarted work
+  to today. `save=true` writes planned dates to tasks and phase due dates.
+- `budget_summary`: totals by cost code and category, contingency left,
+  approved and pending change orders against the contract value.
+
+### Connecting other apps
+
+- `link_external(entity_type, entity_id, system, external_id)` records that a
+  project, phase, task or record matches an id in another system.
+  `find_external` looks it up either way.
+- `export_project` returns the whole project as one JSON document.
+- `extra_details` / `details` on projects and extra `data` fields on records
+  hold app-specific values.
+
+## Agent prompts
+
+- `plan_construction_project`: turn a brief into a phased project.
+- `construction_role_agent`: work one role's tasks and keep the paperwork.
+- `plan_project` / `work_session`: the same for non-construction work.
+
+## Generic tools
 
 | Area | Tools |
 |---|---|
 | Projects | `create_project`, `list_projects`, `update_project`, `project_report` |
-| Milestones | `create_milestone`, `list_milestones` |
+| Phases | `create_milestone`, `list_milestones` |
 | Tasks | `create_task`, `get_task`, `list_tasks`, `update_task`, `add_dependency`, `remove_dependency` |
 | Work queue | `claim_next_task`, `claim_task`, `heartbeat`, `release_task`, `complete_task` |
 | Notes & history | `add_comment`, `get_activity` |
 
-Task statuses: `todo`, `in_progress`, `blocked`, `review`, `done`, `cancelled`.
-Priorities: `low`, `medium`, `high`, `urgent`. Project statuses: `active`,
-`on_hold`, `completed`, `archived` (only `active` projects hand out work).
-
-Rules the server enforces: unique project names; dependencies and parents must
-be in the same project; dependency cycles are rejected; only the assigned agent
-can heartbeat, release or complete a task; a task can't be claimed while its
-dependencies are unfinished or another agent holds it.
+A claim lasts `lease_minutes` (default 30). If the agent stops sending
+`heartbeat`, the task goes back to the queue. Only the assigned agent can
+heartbeat, release or complete a task; dependencies must be in the same
+project and can't form cycles.
 
 ## Layout
 
 ```
-src/pm_mcp/store.py    SQLite schema and all business rules
-src/pm_mcp/server.py   MCP tools, resource, prompts, CLI entry point
-tests/                 store unit tests + end-to-end test through an MCP client
+src/pm_mcp/store.py         SQLite schema, migrations, tasks/claims/leases, gate check
+src/pm_mcp/construction.py  Templates applied to projects, records + workflow hooks,
+                            budget, dashboard, external links, export
+src/pm_mcp/templates.py     Built-in phase/task templates and the template format
+src/pm_mcp/records.py       Record types: fields, statuses, validation
+src/pm_mcp/schedule.py      Critical-path scheduling on a working-day calendar
+src/pm_mcp/server.py        MCP tools, resources, prompts, CLI
 ```
 
 Built on the `mcp` Python SDK 2.x (`MCPServer`).

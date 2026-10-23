@@ -61,3 +61,51 @@ def test_agent_workflow_over_mcp():
             assert "claim_next_task" in prompt.messages[0].content.text
 
     anyio.run(run)
+
+
+def test_construction_workflow_over_mcp():
+    async def run():
+        async with Client(server.mcp) as c:
+            templates = data(await c.call_tool("list_templates", {}))
+            assert {"residential_new", "commercial_new"} <= {t["key"] for t in templates}
+
+            created = data(await c.call_tool("create_construction_project", {
+                "name": "Main St Retail", "template": "commercial_tenant_improvement",
+                "start_date": "2027-01-04", "contract_value": 250000, "jurisdiction": "Riverside County",
+                "extra_details": {"crm_deal": "D-77"}, "actor": "planner",
+            }))
+            pid = created["project"]["id"]
+            assert created["project"]["details"]["crm_deal"] == "D-77"
+            assert created["schedule"]["finish_date"] > "2027-01-04"
+
+            # A permit agent works only its own role's tasks.
+            await c.call_tool("update_project", {"project_id": pid, "details": {"crm_deal": None, "square_feet": 4200}})
+            records = data(await c.call_tool("list_records", {"project_id": pid, "record_type": "permit"}))
+            building = next(r for r in records if "TI building permit" in r["title"])
+            done = data(await c.call_tool("update_record", {
+                "record_id": building["id"], "status": "approved", "data": {"permit_number": "TI-9"},
+            }))
+            assert done["completed_task"] == building["task_id"]
+
+            rfi = data(await c.call_tool("create_record", {
+                "project_id": pid, "record_type": "rfi", "data": {"question": "Ceiling height at storefront?"},
+            }))
+            assert rfi["number"] == 1
+            bad = await c.call_tool("create_record", {"project_id": pid, "record_type": "rfi", "data": {}})
+            assert bad.is_error and "question" in bad.content[0].text
+
+            dash = data(await c.call_tool("construction_dashboard", {"project_id": pid}))
+            assert dash["project"]["details"]["square_feet"] == 4200
+            assert "crm_deal" not in dash["project"]["details"]
+            assert dash["open_items"]["rfi"] == 1
+
+            sched = data(await c.call_tool("compute_schedule", {"project_id": pid, "mode": "plan"}))
+            assert sched["critical_path"]
+            types = data(await c.call_tool("describe_record_types", {}))
+            assert {t["type"] for t in types} >= {"permit", "inspection", "change_order", "daily_log"}
+
+            prompt = await c.get_prompt("construction_role_agent",
+                                        {"agent": "est-1", "role": "estimator", "project_id": str(pid)})
+            assert "tags=['estimator']" in prompt.messages[0].content.text
+
+    anyio.run(run)
