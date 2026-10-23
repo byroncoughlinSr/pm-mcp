@@ -242,6 +242,13 @@ def test_external_links_and_export(c, house):
         other = c.store.create_project("Other")
         c.link_external("project", other["id"], "vr-construction", "42")
     assert c.find_external("vr-construction", "42")[0]["entity_id"] == pid
+    c.unlink_external("project", "vr-construction", "42")  # move it to the other project and back
+    c.link_external("project", other["id"], "vr-construction", "42")
+    assert c.find_external("vr-construction", "42")[0]["entity_id"] == other["id"]
+    assert c.unlink_external("project", "vr-construction", "42")["entity_id"] == other["id"]
+    with pytest.raises(PMError, match="not linked"):
+        c.unlink_external("project", "vr-construction", "42")
+    c.link_external("project", pid, "vr-construction", "42")
     export = c.export_project(pid)
     assert export["format"] == "pm-mcp/1"
     assert len(export["tasks"]) == house["tasks_created"]

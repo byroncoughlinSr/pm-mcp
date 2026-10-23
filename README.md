@@ -136,7 +136,8 @@ HTTP (`--transport streamable-http --port 8765`).
 
 - `link_external(entity_type, entity_id, system, external_id)` records that a
   project, phase, task or record matches an id in another system.
-  `find_external` looks it up either way.
+  `find_external` looks it up either way; `unlink_external` removes a link
+  (to move it, unlink then link again).
 - `export_project` returns the whole project as one JSON document.
 - `extra_details` / `details` on projects and extra `data` fields on records
   hold app-specific values.

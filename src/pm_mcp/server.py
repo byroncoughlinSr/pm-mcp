@@ -576,6 +576,14 @@ def link_external(
 
 @mcp.tool()
 @pm_errors
+def unlink_external(entity_type: EntityType, system: str, external_id: str, actor: str | None = None) -> dict:
+    """Remove the link from an id in another system to our entity, e.g. to
+    point it at a different project with link_external afterwards."""
+    return cx().unlink_external(entity_type, system, external_id, actor)
+
+
+@mcp.tool()
+@pm_errors
 def find_external(
     system: str, external_id: str | None = None, entity_type: EntityType | None = None,
     entity_id: int | None = None,

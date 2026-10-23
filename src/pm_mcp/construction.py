@@ -610,7 +610,8 @@ class Construction:
                 (entity_type, system, str(external_id)),
             ).fetchone()
             if existing and existing["entity_id"] != entity_id:
-                raise PMError(f"{system}:{external_id} is already linked to {entity_type} {existing['entity_id']}")
+                raise PMError(f"{system}:{external_id} is already linked to {entity_type} {existing['entity_id']}"
+                              " (unlink_external it first to move the link)")
             if not existing:
                 db.execute(
                     "INSERT INTO external_refs (entity_type, entity_id, system, external_id, created_at)"
@@ -619,6 +620,22 @@ class Construction:
                 self.store._log(db, "external_linked", actor, entity_type=entity_type, entity_id=entity_id,
                                 system=system, external_id=str(external_id))
         return {"entity_type": entity_type, "entity_id": entity_id, "system": system, "external_id": str(external_id)}
+
+    def unlink_external(self, entity_type: str, system: str, external_id: str, actor: str | None = None) -> dict:
+        if entity_type not in ENTITY_TABLES:
+            raise PMError(f"entity_type must be one of {', '.join(ENTITY_TABLES)}")
+        with self.store._tx() as db:
+            existing = db.execute(
+                "SELECT * FROM external_refs WHERE entity_type = ? AND system = ? AND external_id = ?",
+                (entity_type, system, str(external_id)),
+            ).fetchone()
+            if not existing:
+                raise PMError(f"{system}:{external_id} is not linked to any {entity_type}")
+            db.execute("DELETE FROM external_refs WHERE id = ?", (existing["id"],))
+            self.store._log(db, "external_unlinked", actor, entity_type=entity_type,
+                            entity_id=existing["entity_id"], system=system, external_id=str(external_id))
+        return {"entity_type": entity_type, "entity_id": existing["entity_id"], "system": system,
+                "external_id": str(external_id), "unlinked": True}
 
     def find_external(self, system: str, external_id: str | None = None, entity_type: str | None = None,
                       entity_id: int | None = None) -> list[dict]:
