@@ -139,6 +139,13 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     );
     """,
+    # 3: when work actually started, task-level cost, and app data on phases.
+    """
+    ALTER TABLE tasks ADD COLUMN started_at TEXT;
+    ALTER TABLE tasks ADD COLUMN budgeted_cost REAL;
+    ALTER TABLE tasks ADD COLUMN actual_cost REAL;
+    ALTER TABLE milestones ADD COLUMN details TEXT NOT NULL DEFAULT '{}';
+    """,
 ]
 
 
@@ -243,6 +250,12 @@ class Store:
         return project
 
     @staticmethod
+    def _milestone_dict(row: sqlite3.Row) -> dict[str, Any]:
+        milestone = dict(row)
+        milestone["details"] = json.loads(milestone.get("details") or "{}")
+        return milestone
+
+    @staticmethod
     def _task_dict(row: sqlite3.Row) -> dict[str, Any]:
         task = dict(row)
         task["priority"] = PRIORITY_NAMES.get(task["priority"], task["priority"])
@@ -324,8 +337,8 @@ class Store:
         now = _ts(_now())
         db.execute(
             "UPDATE tasks SET status = 'done', result = COALESCE(?, result), lease_expires_at = NULL,"
-            " completed_at = ?, updated_at = ? WHERE id = ?",
-            (result, now, now, task["id"]),
+            " started_at = COALESCE(started_at, ?), completed_at = ?, updated_at = ? WHERE id = ?",
+            (result, now, now, now, task["id"]),
         )
         self._log(db, "task_completed", actor, task["project_id"], task["id"], via="gate")
 
@@ -423,7 +436,35 @@ class Store:
         with self._tx() as db:
             self._project_row(db, project_id)
             milestone_id = self._insert_milestone(db, project_id, name, description, due_date, actor)
-            return dict(self._milestone_row(db, milestone_id))
+            return self._milestone_dict(self._milestone_row(db, milestone_id))
+
+    def update_milestone(self, milestone_id: int, actor: str | None = None, **fields) -> dict:
+        """Edit name/description/due_date (due_date="" clears it). ``details`` is
+        merged key by key; a key set to None is removed."""
+        changes = {k: fields[k] for k in ("name", "description") if fields.get(k) is not None}
+        if "name" in changes and not changes["name"].strip():
+            raise PMError("milestone name cannot be empty")
+        if fields.get("due_date") == "":
+            changes["due_date"] = None
+        elif fields.get("due_date") is not None:
+            try:
+                changes["due_date"] = datetime.fromisoformat(fields["due_date"]).date().isoformat()
+            except ValueError:
+                raise PMError("due_date must be an ISO date like 2026-11-30") from None
+        with self._tx() as db:
+            current = self._milestone_dict(self._milestone_row(db, milestone_id))
+            if fields.get("details"):
+                merged = {**current["details"], **fields["details"]}
+                changes["details"] = json.dumps({k: v for k, v in merged.items() if v is not None})
+            if changes:
+                sets = ", ".join(f"{k} = ?" for k in changes)
+                try:
+                    db.execute(f"UPDATE milestones SET {sets} WHERE id = ?", (*changes.values(), milestone_id))
+                except sqlite3.IntegrityError:
+                    raise PMError(f"milestone {changes.get('name')!r} already exists in this project") from None
+                logged = {k: (fields["details"] if k == "details" else v) for k, v in changes.items()}
+                self._log(db, "milestone_updated", actor, current["project_id"], milestone_id=milestone_id, **logged)
+            return self._milestone_dict(self._milestone_row(db, milestone_id))
 
     def list_milestones(self, project_id: int) -> list[dict]:
         with self._lock:
@@ -435,7 +476,7 @@ class Store:
                 " WHERE m.project_id = ? GROUP BY m.id ORDER BY m.id",
                 (project_id,),
             ).fetchall()
-        return [{**dict(r), "done_count": r["done_count"] or 0} for r in rows]
+        return [{**self._milestone_dict(r), "done_count": r["done_count"] or 0} for r in rows]
 
     # -- tasks --------------------------------------------------------------
 
@@ -444,14 +485,17 @@ class Store:
         parent_id: int | None = None, milestone_id: int | None = None, depends_on: list[int] | None = None,
         tags: list[str] | None = None, estimate_hours: float | None = None, assignee: str | None = None,
         actor: str | None = None, kind: str = "task", duration_days: float | None = None,
+        budgeted_cost: float | None = None, actual_cost: float | None = None,
     ) -> sqlite3.Row:
         title = title.strip()
         if not title:
             raise PMError("task title is required")
         if kind not in TASK_KINDS:
             raise PMError(f"task kind must be one of {', '.join(TASK_KINDS)}")
-        if duration_days is not None and duration_days < 0:
-            raise PMError("duration_days cannot be negative")
+        for name, value in (("duration_days", duration_days), ("budgeted_cost", budgeted_cost),
+                            ("actual_cost", actual_cost)):
+            if value is not None and value < 0:
+                raise PMError(f"{name} cannot be negative")
         prio = _priority(priority)
         if parent_id is not None and self._task_row(db, parent_id)["project_id"] != project_id:
             raise PMError(f"parent task {parent_id} belongs to a different project")
@@ -460,10 +504,11 @@ class Store:
         now = _ts(_now())
         cur = db.execute(
             "INSERT INTO tasks (project_id, milestone_id, parent_id, title, description, priority,"
-            " assignee, tags, estimate_hours, created_by, created_at, updated_at, kind, duration_days)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " assignee, tags, estimate_hours, created_by, created_at, updated_at, kind, duration_days,"
+            " budgeted_cost, actual_cost) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (project_id, milestone_id, parent_id, title, description, prio, assignee,
-             json.dumps(sorted(set(tags or []))), estimate_hours, actor, now, now, kind, duration_days),
+             json.dumps(sorted(set(tags or []))), estimate_hours, actor, now, now, kind, duration_days,
+             budgeted_cost, actual_cost),
         )
         task = self._task_row(db, cur.lastrowid)
         for dep in depends_on or []:
@@ -487,14 +532,27 @@ class Store:
         actor: str | None = None,
         kind: str = "task",
         duration_days: float | None = None,
+        budgeted_cost: float | None = None,
+        actual_cost: float | None = None,
     ) -> dict:
         with self._tx() as db:
             self._project_row(db, project_id)
             task = self._insert_task(
                 db, project_id, title, description, priority, parent_id, milestone_id, depends_on,
-                tags, estimate_hours, assignee, actor, kind, duration_days,
+                tags, estimate_hours, assignee, actor, kind, duration_days, budgeted_cost, actual_cost,
             )
             return self._task_dict(task)
+
+    def delete_task(self, task_id: int, actor: str | None = None) -> dict:
+        """Delete a task with its subtasks, comments and dependency links. Records
+        linked to it stay, unlinked."""
+        with self._tx() as db:
+            task = self._task_row(db, task_id)
+            db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            db.execute("DELETE FROM external_refs WHERE entity_type = 'task' AND entity_id = ?", (task_id,))
+            self._log(db, "task_deleted", actor, task["project_id"], None, deleted_task_id=task_id,
+                      title=task["title"])
+        return {"deleted": task_id}
 
     def get_task(self, task_id: int) -> dict:
         with self._lock:
@@ -583,8 +641,22 @@ class Store:
 
     def update_task(self, task_id: int, actor: str | None = None, **fields) -> dict:
         allowed = {"title", "description", "status", "priority", "assignee", "milestone_id",
-                   "tags", "estimate_hours", "result", "duration_days"}
+                   "tags", "estimate_hours", "result", "duration_days", "kind", "budgeted_cost", "actual_cost",
+                   "planned_start", "planned_finish"}
         changes = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        for key in ("planned_start", "planned_finish"):
+            if changes.get(key) == "":
+                changes[key] = None
+            elif key in changes:
+                try:
+                    changes[key] = datetime.fromisoformat(changes[key]).date().isoformat()
+                except ValueError:
+                    raise PMError(f"{key} must be an ISO date like 2026-11-30") from None
+        if "kind" in changes and changes["kind"] not in TASK_KINDS:
+            raise PMError(f"task kind must be one of {', '.join(TASK_KINDS)}")
+        for name in ("budgeted_cost", "actual_cost"):
+            if changes.get(name, 0) < 0:
+                raise PMError(f"{name} cannot be negative")
         # An empty assignee or a milestone_id of 0 clears the field.
         if fields.get("assignee") == "":
             changes["assignee"] = None
@@ -605,8 +677,11 @@ class Store:
                 if self._milestone_row(db, changes["milestone_id"])["project_id"] != task["project_id"]:
                     raise PMError("milestone belongs to a different project")
             status = changes.get("status")
+            if status in ("in_progress", "review", "done") and not task["started_at"]:
+                changes["started_at"] = now
             if status == "done" and task["status"] != "done":
-                self._check_gate(db, task)
+                # Judge the gate by the kind the task will have after this update.
+                self._check_gate(db, {**dict(task), "kind": changes.get("kind", task["kind"])})
                 changes["completed_at"] = now
             elif status and status != "done" and task["status"] == "done":
                 changes["completed_at"] = None
@@ -678,8 +753,8 @@ class Store:
                 now = _ts(_now())
                 db.execute(
                     "UPDATE tasks SET status = 'in_progress', assignee = ?, lease_expires_at = ?,"
-                    " updated_at = ? WHERE id = ?",
-                    (agent, self._lease(lease_minutes), now, row["id"]),
+                    " started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
+                    (agent, self._lease(lease_minutes), now, now, row["id"]),
                 )
                 self._log(db, "task_claimed", agent, row["project_id"], row["id"])
                 return self._task_dict(self._task_row(db, row["id"]))
@@ -702,8 +777,8 @@ class Store:
                 raise PMError(f"task {task_id} is waiting on unfinished tasks {open_deps}")
             db.execute(
                 "UPDATE tasks SET status = 'in_progress', assignee = ?, lease_expires_at = ?,"
-                " updated_at = ? WHERE id = ?",
-                (agent, self._lease(lease_minutes), _ts(_now()), task_id),
+                " started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
+                (agent, self._lease(lease_minutes), _ts(_now()), _ts(_now()), task_id),
             )
             self._log(db, "task_claimed", agent, task["project_id"], task_id)
             return self._task_dict(self._task_row(db, task_id))
@@ -766,8 +841,8 @@ class Store:
             now = _ts(_now())
             db.execute(
                 "UPDATE tasks SET status = 'done', assignee = ?, result = ?, lease_expires_at = NULL,"
-                " completed_at = ?, updated_at = ? WHERE id = ?",
-                (agent, result or None, now, now, task_id),
+                " started_at = COALESCE(started_at, ?), completed_at = ?, updated_at = ? WHERE id = ?",
+                (agent, result or None, now, now, now, task_id),
             )
             db.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now, task["project_id"]))
             self._log(db, "task_completed", agent, task["project_id"], task_id)

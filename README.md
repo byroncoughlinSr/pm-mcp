@@ -78,7 +78,9 @@ Tasks carry working-day durations, dependencies, and **role tags** (`architect`,
 that is ready to start.
 
 Apps can store their own plans with `save_template` (start from
-`get_template("residential_new")` to copy the format).
+`get_template("residential_new")` to copy the format). `apply_template` lays a
+template into a project that already exists (phases with the same name are
+reused).
 
 ### Gates: permits and inspections
 
@@ -128,6 +130,10 @@ kept, so an app can attach its own.
 
 ### Connecting other apps
 
+The VR construction project (`/development/vr-ai-construction-project`) is one
+such app: its backend keeps each project's plan here and talks to pm-mcp over
+HTTP (`--transport streamable-http --port 8765`).
+
 - `link_external(entity_type, entity_id, system, external_id)` records that a
   project, phase, task or record matches an id in another system.
   `find_external` looks it up either way.
@@ -146,10 +152,17 @@ kept, so an app can attach its own.
 | Area | Tools |
 |---|---|
 | Projects | `create_project`, `list_projects`, `update_project`, `project_report` |
-| Phases | `create_milestone`, `list_milestones` |
-| Tasks | `create_task`, `get_task`, `list_tasks`, `update_task`, `add_dependency`, `remove_dependency` |
+| Phases | `create_milestone`, `list_milestones`, `update_milestone` |
+| Tasks | `create_task`, `get_task`, `list_tasks`, `update_task`, `delete_task`, `add_dependency`, `remove_dependency` |
 | Work queue | `claim_next_task`, `claim_task`, `heartbeat`, `release_task`, `complete_task` |
 | Notes & history | `add_comment`, `get_activity` |
+
+Tasks also carry `started_at` (set the first time work starts), optional
+`budgeted_cost` / `actual_cost` (reported apart from budget lines in
+`budget_summary.task_costs`), and `planned_start` / `planned_finish`, which
+`compute_schedule(save=true)` writes and `update_task` can set by hand. Phases
+(milestones) have a free-form `details` object for app data. Records can be
+removed with `delete_record`.
 
 A claim lasts `lease_minutes` (default 30). If the agent stops sending
 `heartbeat`, the task goes back to the queue. Only the assigned agent can

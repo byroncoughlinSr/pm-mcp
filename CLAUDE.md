@@ -87,6 +87,17 @@ start of claims, `list_tasks` and `project_report`; there is no background job.
 Migrations run statement by statement, split on `;`, so don't put semicolons
 inside SQL strings. `test_upgrades_a_version_1_database` covers the path.
 
+### Apps that manage the plan themselves
+
+Some consuming apps edit the plan directly rather than through agents (the VR
+construction backend does, over HTTP). Tools for them: `update_milestone`
+(name, due date, `details` JSON), `delete_task`, `delete_record`,
+`apply_template` into an existing project, `update_task` with `kind`,
+`budgeted_cost`/`actual_cost` and hand-set `planned_start`/`planned_finish`.
+`started_at` is stamped the first time a task goes in progress (claim or
+status), never cleared. Changing `kind` in the same `update_task` as
+`status="done"` is judged by the new kind.
+
 ### Data conventions
 
 - Priority is stored as an integer (1–4) so SQL can sort by it. `_task_dict()` converts it back to

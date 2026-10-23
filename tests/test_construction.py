@@ -259,7 +259,77 @@ def test_upgrades_a_version_1_database(tmp_path):
     db.close()
     st = Store(path)
     assert st.list_projects()[0]["details"] == {}
-    assert st._db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert st._db.execute("PRAGMA user_version").fetchone()[0] == 3
     Construction(st).create_record(1, "contact", data={"role": "owner", "name": "Pat"})
     st.close()
     assert Store(path).list_projects()[0]["name"] == "Legacy"  # reopening doesn't re-migrate
+
+
+# -- additions for apps that manage the plan themselves ----------------------
+
+def test_started_at_task_costs_and_kind_switch(s, c):
+    p = s.create_project("Shed")
+    t = s.create_task(p["id"], "Pour pad", budgeted_cost=1200, actual_cost=0)
+    assert t["started_at"] is None and t["budgeted_cost"] == 1200
+    started = s.update_task(t["id"], status="in_progress")
+    assert started["started_at"]
+    s.update_task(t["id"], status="todo")
+    assert s.get_task(t["id"])["started_at"] == started["started_at"]  # first start is kept
+
+    # Turning a task into an inspection gate makes its record hold completion.
+    s.update_task(t["id"], kind="inspection")
+    insp = c.create_record(p["id"], "inspection", data={"inspection_type": "slab"}, task_id=t["id"])
+    with pytest.raises(PMError, match="gated"):
+        s.update_task(t["id"], status="done")
+    assert s.update_task(t["id"], status="done", kind="task")["status"] == "done"  # switching back frees it
+    assert c.get_record(insp["id"])["status"] == "not_scheduled"
+    with pytest.raises(PMError, match="kind must be"):
+        s.update_task(t["id"], kind="chore")
+    assert c.budget_summary(p["id"])["task_costs"] == {"budgeted": 1200.0, "actual": 0.0}
+
+
+def test_update_milestone(s):
+    p = s.create_project("Shed")
+    m = s.create_milestone(p["id"], "Site prep")
+    s.create_milestone(p["id"], "Framing")
+    u = s.update_milestone(m["id"], name="Site work", due_date="2026-12-01", details={"progress": 40, "x": 1})
+    assert (u["name"], u["due_date"], u["details"]) == ("Site work", "2026-12-01", {"progress": 40, "x": 1})
+    u = s.update_milestone(m["id"], due_date="", details={"x": None})
+    assert u["due_date"] is None and u["details"] == {"progress": 40}
+    with pytest.raises(PMError, match="already exists"):
+        s.update_milestone(m["id"], name="Framing")
+    assert s.list_milestones(p["id"])[0]["details"] == {"progress": 40}
+
+
+def test_delete_task_and_record(s, c):
+    p = s.create_project("Shed")
+    a = s.create_task(p["id"], "A")
+    b = s.create_task(p["id"], "B", depends_on=[a["id"]])
+    rfi = c.create_record(p["id"], "rfi", data={"question": "?"}, task_id=a["id"])
+    c.link_external("task", a["id"], "app", "T-1")
+    s.delete_task(a["id"])
+    assert s.get_task(b["id"])["depends_on"] == []
+    assert c.get_record(rfi["id"])["task_id"] is None
+    assert c.find_external("app", "T-1") == []
+    c.delete_record(rfi["id"])
+    with pytest.raises(PMError, match="not found"):
+        c.get_record(rfi["id"])
+
+
+def test_apply_template_to_existing_project(s, c):
+    p = s.create_project("Kitchen", details={"start_date": "2027-02-01"})
+    s.create_milestone(p["id"], "2. Design")  # reused by name
+    result = c.apply_template(p["id"], "residential_remodel")
+    assert result["tasks_created"] == len(BUILTIN_TEMPLATES["residential_remodel"].tasks)
+    assert len(s.list_milestones(p["id"])) == 8
+    assert result["schedule"]["start_date"] == "2027-02-01"
+
+
+def test_planned_dates_by_hand(s):
+    p = s.create_project("Shed")
+    t = s.create_task(p["id"], "Frame")
+    u = s.update_task(t["id"], planned_start="2027-03-01", planned_finish="2027-03-05")
+    assert (u["planned_start"], u["planned_finish"]) == ("2027-03-01", "2027-03-05")
+    assert s.update_task(t["id"], planned_finish="")["planned_finish"] is None
+    with pytest.raises(PMError, match="ISO date"):
+        s.update_task(t["id"], planned_start="March")

@@ -128,42 +128,57 @@ class Construction:
         template = self._template(template_key)
         details = validate_details({"project_type": template.project_type, **(details or {})})
         details["template"] = template.key
+        with self.store._tx() as db:
+            project_id = self.store._insert_project(db, name, description or template.description, details, actor)
+            applied = self._apply_template(db, project_id, template, actor)
+        return self._template_result(project_id, applied, details.get("start_date"))
+
+    def apply_template(self, project_id: int, template_key: str, actor: str | None = None) -> dict:
+        """Lay a template's phases and tasks into an existing project. Phases that
+        already exist by name are reused; the template's tasks are added to them."""
+        template = self._template(template_key)
+        with self.store._tx() as db:
+            self.store._project_row(db, project_id)
+            applied = self._apply_template(db, project_id, template, actor)
+        details = self.store.get_project(project_id)["details"]
+        return self._template_result(project_id, applied, details.get("start_date"))
+
+    def _apply_template(self, db, project_id: int, template: Template, actor: str | None) -> dict:
         s = self.store
-        with s._tx() as db:
-            project_id = s._insert_project(db, name, description or template.description, details, actor)
-            phase_ids = {
-                p.key: s._insert_milestone(db, project_id, p.name, p.description, None, actor)
-                for p in template.phases
-            }
-            task_ids: dict[str, int] = {}
-            records_created = 0
-            for t in template.tasks:
-                row = s._insert_task(
-                    db, project_id, t.title, t.description, t.priority, milestone_id=phase_ids[t.phase],
-                    tags=t.roles, actor=actor, kind=t.kind, duration_days=t.duration_days,
-                )
-                task_ids[t.key] = row["id"]
-                if t.kind == "inspection":
-                    self._insert_record(db, project_id, "inspection", t.title, None,
-                                        {"inspection_type": t.inspection_type}, None, row["id"],
-                                        phase_ids[t.phase], actor)
-                    records_created += 1
-                elif t.kind == "permit":
-                    self._insert_record(db, project_id, "permit", t.title, None,
-                                        {"permit_type": t.permit_type}, None, row["id"], phase_ids[t.phase], actor)
-                    records_created += 1
-            for t in template.tasks:  # the template was validated acyclic
-                for dep in t.depends_on:
-                    db.execute("INSERT INTO task_dependencies (task_id, depends_on_id) VALUES (?, ?)",
-                               (task_ids[t.key], task_ids[dep]))
-            s._log(db, "template_applied", actor, project_id, template=template.key, tasks=len(task_ids))
-        result = {
-            "project": s.get_project(project_id),
-            "phases": [{"id": phase_ids[p.key], "name": p.name} for p in template.phases],
-            "tasks_created": len(task_ids),
-            "records_created": records_created,
+        existing = {r["name"]: r["id"] for r in db.execute(
+            "SELECT id, name FROM milestones WHERE project_id = ?", (project_id,))}
+        phase_ids = {
+            p.key: existing.get(p.name) or s._insert_milestone(db, project_id, p.name, p.description, None, actor)
+            for p in template.phases
         }
-        if details.get("start_date"):
+        task_ids: dict[str, int] = {}
+        records_created = 0
+        for t in template.tasks:
+            row = s._insert_task(
+                db, project_id, t.title, t.description, t.priority, milestone_id=phase_ids[t.phase],
+                tags=t.roles, actor=actor, kind=t.kind, duration_days=t.duration_days,
+            )
+            task_ids[t.key] = row["id"]
+            if t.kind == "inspection":
+                self._insert_record(db, project_id, "inspection", t.title, None,
+                                    {"inspection_type": t.inspection_type}, None, row["id"],
+                                    phase_ids[t.phase], actor)
+                records_created += 1
+            elif t.kind == "permit":
+                self._insert_record(db, project_id, "permit", t.title, None,
+                                    {"permit_type": t.permit_type}, None, row["id"], phase_ids[t.phase], actor)
+                records_created += 1
+        for t in template.tasks:  # the template was validated acyclic
+            for dep in t.depends_on:
+                db.execute("INSERT INTO task_dependencies (task_id, depends_on_id) VALUES (?, ?)",
+                           (task_ids[t.key], task_ids[dep]))
+        s._log(db, "template_applied", actor, project_id, template=template.key, tasks=len(task_ids))
+        return {"phases": [{"id": phase_ids[p.key], "name": p.name} for p in template.phases],
+                "tasks_created": len(task_ids), "records_created": records_created}
+
+    def _template_result(self, project_id: int, applied: dict, start_date: str | None) -> dict:
+        result = {"project": self.store.get_project(project_id), **applied}
+        if start_date:
             plan = self.schedule(project_id, mode="plan", save=True)
             result["schedule"] = {k: plan[k] for k in ("start_date", "finish_date", "duration_days")}
             result["schedule"]["critical_path_length"] = len(plan["critical_path"])
@@ -367,6 +382,15 @@ class Construction:
                 data["inspector"] = inspector
             return self._update_record(db, inspection_id, actor, status=result, data=data)
 
+    def delete_record(self, record_id: int, actor: str | None = None) -> dict:
+        with self.store._tx() as db:
+            rec = self._record_row(db, record_id)
+            db.execute("DELETE FROM records WHERE id = ?", (record_id,))
+            db.execute("DELETE FROM external_refs WHERE entity_type = 'record' AND entity_id = ?", (record_id,))
+            self.store._log(db, "record_deleted", actor, rec["project_id"], rec["task_id"],
+                            record_id=record_id, type=rec["type"], title=rec["title"])
+        return {"deleted": record_id}
+
     def get_record(self, record_id: int) -> dict:
         with self.store._lock:
             return self._record_dict(self._record_row(self.store._db, record_id))
@@ -427,8 +451,15 @@ class Construction:
         pending = [c for c in cos if c["status"] in ("draft", "submitted")]
         contract = details.get("contract_value")
         approved_total = round(sum(c["data"].get("cost_impact", 0.0) for c in approved), 2)
+        with self.store._lock:
+            task_costs = self.store._db.execute(
+                "SELECT COALESCE(SUM(budgeted_cost), 0), COALESCE(SUM(actual_cost), 0) FROM tasks"
+                " WHERE project_id = ? AND status <> 'cancelled'", (project_id,),
+            ).fetchone()
         return {
             "totals": totals,
+            # Costs entered on tasks themselves, reported apart from the budget lines.
+            "task_costs": {"budgeted": round(task_costs[0], 2), "actual": round(task_costs[1], 2)},
             "by_cost_code": dict(sorted(by_code.items())),
             "by_category": by_category,
             "contingency": {**contingency, "remaining": round(contingency["budgeted"] - contingency["used"], 2)},

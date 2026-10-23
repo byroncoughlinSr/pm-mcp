@@ -205,6 +205,15 @@ def create_construction_project(
 
 @mcp.tool()
 @pm_errors
+def apply_template(project_id: int, template: str, actor: str | None = None) -> dict:
+    """Add a template's phases and tasks (with gates, permit and inspection
+    records) to an existing project. Phases that already exist by name are reused.
+    If the project has details.start_date the baseline schedule is saved."""
+    return cx().apply_template(project_id, template, actor)
+
+
+@mcp.tool()
+@pm_errors
 def construction_dashboard(project_id: int) -> dict:
     """One-call project overview: current phase, progress per phase, forecast
     finish vs target and the critical path, permits, inspections (scheduled,
@@ -261,6 +270,23 @@ def list_milestones(project_id: int) -> list[dict]:
     return store().list_milestones(project_id)
 
 
+@mcp.tool()
+@pm_errors
+def update_milestone(
+    milestone_id: int,
+    name: str | None = None,
+    description: str | None = None,
+    due_date: str | None = None,
+    details: dict | None = None,
+    actor: str | None = None,
+) -> dict:
+    """Edit a milestone (phase). due_date="" clears it. details holds app data
+    and is merged key by key (null removes a key)."""
+    return store().update_milestone(
+        milestone_id, actor, name=name, description=description, due_date=due_date, details=details,
+    )
+
+
 # -- tasks ------------------------------------------------------------------
 
 @mcp.tool()
@@ -277,6 +303,8 @@ def create_task(
     estimate_hours: float | None = None,
     duration_days: float | None = None,
     kind: TaskKind = "task",
+    budgeted_cost: float | None = None,
+    actual_cost: float | None = None,
     assignee: str | None = None,
     actor: str | None = None,
 ) -> dict:
@@ -286,8 +314,16 @@ def create_task(
     makes it a gate: link a record to it with create_record(task_id=...)."""
     return store().create_task(
         project_id, title, description, priority, parent_id, milestone_id,
-        depends_on, tags, estimate_hours, assignee, actor, kind, duration_days,
+        depends_on, tags, estimate_hours, assignee, actor, kind, duration_days, budgeted_cost, actual_cost,
     )
+
+
+@mcp.tool()
+@pm_errors
+def delete_task(task_id: int, actor: str | None = None) -> dict:
+    """Delete a task with its subtasks, comments and dependency links. Records
+    linked to it are kept, unlinked."""
+    return store().delete_task(task_id, actor)
 
 
 @mcp.tool()
@@ -329,14 +365,23 @@ def update_task(
     tags: list[str] | None = None,
     estimate_hours: float | None = None,
     duration_days: float | None = None,
+    kind: TaskKind | None = None,
+    budgeted_cost: float | None = None,
+    actual_cost: float | None = None,
+    planned_start: str | None = None,
+    planned_finish: str | None = None,
     actor: str | None = None,
 ) -> dict:
     """Edit a task. Only the fields you pass change. assignee="" unassigns;
-    milestone_id=0 removes the milestone; tags replaces the whole list."""
+    milestone_id=0 removes the milestone; tags replaces the whole list. Changing
+    kind to inspection/permit turns the task into a gate. planned_start /
+    planned_finish (YYYY-MM-DD, "" clears) set dates by hand; compute_schedule
+    with save=true overwrites them."""
     return store().update_task(
         task_id, actor, title=title, description=description, status=status, priority=priority,
         assignee=assignee, milestone_id=milestone_id, tags=tags, estimate_hours=estimate_hours,
-        duration_days=duration_days,
+        duration_days=duration_days, kind=kind, budgeted_cost=budgeted_cost, actual_cost=actual_cost,
+        planned_start=planned_start, planned_finish=planned_finish,
     )
 
 
@@ -469,6 +514,13 @@ def record_inspection_result(
     correction task, tagged for the trades that did the inspected work, that the
     gate waits on. Re-inspect by calling this again after the correction is done."""
     return cx().record_inspection_result(inspection_id, result, notes, inspector, actor)
+
+
+@mcp.tool()
+@pm_errors
+def delete_record(record_id: int, actor: str | None = None) -> dict:
+    """Delete a record. A gate task it was linked to stays and is no longer held by it."""
+    return cx().delete_record(record_id, actor)
 
 
 @mcp.tool()
